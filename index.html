@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Touchless ATM</title>
+<style>
+  :root{
+    --bg:#0a1a2a; --panel:rgba(8,24,40,.82); --cyan:#00bbe0; --text:#f2f8fb;
+    --ok:#3ddc84; --warn:#ffd23f; --bad:#ff5d5d;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI","Noto Sans Tamil",sans-serif;overflow:hidden}
+  #stage{position:fixed;inset:0}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+  video{opacity:.55}
+  #ui{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;
+    padding:calc(env(safe-area-inset-top,0px) + 14px) 16px calc(env(safe-area-inset-bottom,0px) + 14px)}
+  .card{background:var(--panel);border:1.5px solid var(--cyan);border-radius:14px;padding:14px 16px;
+    backdrop-filter:blur(4px)}
+  #title{font-size:.8rem;letter-spacing:.04em;color:var(--cyan);margin:0 0 6px}
+  #heading{font-size:1.35rem;font-weight:700;line-height:1.3;margin:0}
+  #body{font-size:1.1rem;line-height:1.55;margin-top:8px;white-space:pre-line}
+  #pin{font-size:2rem;letter-spacing:.5rem;color:var(--warn);margin-top:6px;min-height:2.4rem}
+  .status{font-size:.95rem}
+  #bar{height:8px;border-radius:6px;background:rgba(255,255,255,.15);overflow:hidden;margin-top:8px}
+  #fill{height:100%;width:0;background:var(--cyan);transition:width .08s linear}
+  #big{position:absolute;right:16px;top:50%;transform:translateY(-50%);font-size:5rem;font-weight:800;
+    color:var(--ok);text-shadow:0 2px 12px #000;pointer-events:none}
+  #start{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:14px;background:var(--bg);z-index:5;padding:24px;text-align:center}
+  #start h1{margin:0;font-size:1.7rem}
+  #start p{margin:0;max-width:30ch;opacity:.85;line-height:1.5}
+  button{font:inherit;font-weight:700;background:var(--cyan);color:#04202c;border:0;border-radius:12px;
+    padding:14px 28px;font-size:1.1rem}
+  button:focus-visible{outline:3px solid #fff;outline-offset:3px}
+  #err{color:var(--bad);min-height:1.4em}
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>Touchless ATM</h1>
+  <p>Show finger gestures to the front camera. Demo PIN is 1234.</p>
+  <button id="startBtn">Start camera</button>
+  <div id="err" role="alert"></div>
+</div>
+
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="big"></div>
+  <div id="ui">
+    <div class="card">
+      <p id="title">Touchless ATM</p>
+      <h2 id="heading"></h2>
+      <div id="pin"></div>
+      <div id="body"></div>
+    </div>
+    <div class="card">
+      <div class="status" id="status">Loading hand tracker…</div>
+      <div id="bar"><div id="fill"></div></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+/* ---------- Config ---------- */
+const STABLE_FRAMES = 24;            // same as the review: pose must hold for 24 frames
+const DEMO_PIN = "1234";
+const START_BALANCE = 25000;
+const AMOUNTS = {1:500, 2:1000, 3:2000, 4:5000, 5:10000};
+const EMA_ALPHA = 0.5;               // landmark smoothing (EMA)
+
+/* ---------- Text (English + Tamil). Tamil renders correctly in HTML. ---------- */
+const TXT = {
+  lang:    {en:"Select language\n1 – English   2 – Tamil   3 – Both",
+            ta:"மொழியைத் தேர்ந்தெடுக்கவும்"},
+  enterPin:{en:"Enter your PIN", ta:"உங்கள் பின் எண்ணை உள்ளிடவும்"},
+  hold:    {en:"Hold each gesture steady, then change or release.",
+            ta:"ஒவ்வொரு சைகையையும் நிலையாகப் பிடிக்கவும்."},
+  verified:{en:"PIN verified. Welcome!", ta:"பின் சரிபார்க்கப்பட்டது. வரவேற்கிறோம்!"},
+  wrong:   {en:"Wrong PIN. Try again.", ta:"தவறான பின். மீண்டும் முயற்சிக்கவும்."},
+  blocked: {en:"Too many wrong attempts. Restarting.", ta:"பல தவறான முயற்சிகள். மீண்டும் தொடங்குகிறது."},
+  menu:    {en:"Main menu\n1 – Check balance\n2 – Withdraw cash\n3 – Exit",
+            ta:"முதன்மை பட்டி\n1 – இருப்பு பார்க்க\n2 – பணம் எடுக்க\n3 – வெளியேற"},
+  balance: {en:"Your balance is ₹{b}", ta:"உங்கள் இருப்பு ₹{b}"},
+  amount:  {en:"Select amount\n1 – ₹500   2 – ₹1000   3 – ₹2000\n4 – ₹5000   5 – ₹10000",
+            ta:"தொகையைத் தேர்ந்தெடுக்கவும்"},
+  confirm: {en:"Withdraw ₹{a}?\n1 – Confirm   2 – Cancel",
+            ta:"₹{a} எடுக்கவா?\n1 – உறுதி   2 – ரத்து"},
+  done:    {en:"Please collect your cash: ₹{a}", ta:"உங்கள் பணம் ₹{a} எடுத்துக்கொள்ளவும்."},
+  cancel:  {en:"Withdrawal cancelled.", ta:"பணம் எடுத்தல் ரத்து செய்யப்பட்டது."},
+  nofunds: {en:"Insufficient balance.", ta:"போதிய இருப்பு இல்லை."},
+  thanks:  {en:"Thank you. Goodbye!", ta:"நன்றி. வணக்கம்!"},
+  pick:    {en:"Show a number from 1 to 3.", ta:"1 முதல் 3 வரை காட்டவும்."}
+};
+
+/* ---------- State machine ---------- */
+let lang = "both";                   // en | ta | both
+let state = "LANG";
+let pin = "", wrongTries = 0, balance = START_BALANCE, pendingAmount = 0, busy = false;
+
+const $ = id => document.getElementById(id);
+const fmt = (s, v) => s.replace("{b}", v?.b ?? "").replace("{a}", v?.a ?? "");
+
+function say(key, vars, {heading=false} = {}) {
+  const t = TXT[key];
+  const en = fmt(t.en, vars), ta = fmt(t.ta, vars);
+  let shown = lang === "en" ? en : lang === "ta" ? ta : en + "\n" + ta;
+  if (state === "LANG") shown = t.en + "\n" + t.ta;      // language screen always bilingual
+  return {shown, en, ta};
+}
+
+function speak(en, ta) {
+  if (!("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const queue = [];
+  if (lang !== "ta") queue.push([en.replace(/\n/g, ". "), "en-IN"]);
+  if (lang !== "en") queue.push([ta.replace(/\n/g, ". "), "ta-IN"]);
+  for (const [text, l] of queue) {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = l; u.rate = 0.95;
+    speechSynthesis.speak(u);
+  }
+}
+
+function render(headKey, bodyKey, vars, opts = {}) {
+  const h = say(headKey, vars), b = bodyKey ? say(bodyKey, vars) : null;
+  $("heading").textContent = h.shown;
+  $("body").textContent = b ? b.shown : "";
+  $("pin").textContent = opts.showPin ? "*".repeat(pin.length).padEnd(4, "·") : "";
+  speak(h.en + (b ? ". " + b.en : ""), h.ta + (b ? ". " + b.ta : ""));
+}
+
+function enter(newState) {
+  state = newState;
+  switch (state) {
+    case "LANG":   render("lang"); break;
+    case "PIN":    render("enterPin", "hold", null, {showPin:true}); break;
+    case "MENU":   render("menu"); break;
+    case "AMOUNT": render("amount"); break;
+    case "CONFIRM":render("confirm", null, {a:pendingAmount}); break;
+  }
+}
+
+function flash(key, vars, next, ms = 2600) {
+  busy = true;
+  render(key, null, vars);
+  setTimeout(() => { busy = false; if (next === "RESET") reset(); else enter(next); }, ms);
+}
+
+function reset() { pin = ""; wrongTries = 0; pendingAmount = 0; lang = "both"; enter("LANG"); }
+
+/* ---------- Gesture accepted (after 24 stable frames) ---------- */
+function onGesture(n) {
+  if (busy) return;
+  switch (state) {
+    case "LANG":
+      if (n >= 1 && n <= 3) { lang = ["", "en", "ta", "both"][n]; enter("PIN"); }
+      break;
+    case "PIN":
+      pin += String(n);
+      $("pin").textContent = "*".repeat(pin.length).padEnd(4, "·");
+      if (pin.length === 4) {
+        if (pin === DEMO_PIN) { pin = ""; wrongTries = 0; flash("verified", null, "MENU"); }
+        else {
+          pin = ""; wrongTries++;
+          if (wrongTries >= 3) flash("blocked", null, "RESET");
+          else flash("wrong", null, "PIN");
+        }
+      }
+      break;
+    case "MENU":
+      if (n === 1) flash("balance", {b: balance.toLocaleString("en-IN")}, "MENU", 3500);
+      else if (n === 2) enter("AMOUNT");
+      else if (n === 3) flash("thanks", null, "RESET");
+      break;
+    case "AMOUNT":
+      if (AMOUNTS[n]) { pendingAmount = AMOUNTS[n]; enter("CONFIRM"); }
+      break;
+    case "CONFIRM":
+      if (n === 1) {
+        if (pendingAmount > balance) flash("nofunds", null, "MENU");
+        else { balance -= pendingAmount; flash("done", {a: pendingAmount}, "MENU", 3500); }
+      } else if (n === 2) flash("cancel", null, "MENU");
+      break;
+  }
+}
+
+/* ---------- Hand maths: Euclidean distances on smoothed landmarks ---------- */
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z - b.z) * 0.5);
+
+function countFingers(lm) {
+  const wrist = lm[0];
+  let n = 0;
+  // index(8,6) middle(12,10) ring(16,14) pinky(20,18): tip farther from wrist than PIP joint
+  for (const [tip, pip] of [[8,6],[12,10],[16,14],[20,18]])
+    if (dist(lm[tip], wrist) > dist(lm[pip], wrist) * 1.08) n++;
+  // thumb: tip farther from pinky base than the thumb IP joint
+  if (dist(lm[4], lm[17]) > dist(lm[3], lm[17]) * 1.05) n++;
+  return n;
+}
+
+let smooth = null;                       // EMA state
+function ema(lm) {
+  if (!smooth) smooth = lm.map(p => ({x:p.x, y:p.y, z:p.z}));
+  else lm.forEach((p, i) => {
+    smooth[i].x += EMA_ALPHA * (p.x - smooth[i].x);
+    smooth[i].y += EMA_ALPHA * (p.y - smooth[i].y);
+    smooth[i].z += EMA_ALPHA * (p.z - smooth[i].z);
+  });
+  return smooth;
+}
+
+/* ---------- Stability counter ---------- */
+let candidate = -1, stable = 0, locked = false;
+
+function updateStability(count) {
+  if (count === candidate) stable++; else { candidate = count; stable = 1; locked = false; }
+  if (stable >= STABLE_FRAMES && !locked) { locked = true; onGesture(count); }
+  $("fill").style.width = Math.min(100, (stable / STABLE_FRAMES) * 100) + "%";
+  $("status").textContent = `Detected: ${count}   Stable: ${Math.min(stable, STABLE_FRAMES)}/${STABLE_FRAMES}`;
+}
+function noHand() {
+  candidate = -1; stable = 0; locked = false; smooth = null;
+  $("fill").style.width = "0%";
+  $("status").textContent = "Show your hand to the camera";
+  $("big").textContent = "";
+}
+
+/* ---------- Drawing ---------- */
+const canvas = $("overlay"), ctx = canvas.getContext("2d");
+const LINKS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+function draw(lm, vw, vh) {
+  canvas.width = vw; canvas.height = vh;
+  ctx.clearRect(0, 0, vw, vh);
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(255,255,255,.85)";
+  for (const [a, b] of LINKS) {
+    ctx.beginPath(); ctx.moveTo(lm[a].x * vw, lm[a].y * vh); ctx.lineTo(lm[b].x * vw, lm[b].y * vh); ctx.stroke();
+  }
+  ctx.fillStyle = "#ff3b3b";
+  for (const p of lm) { ctx.beginPath(); ctx.arc(p.x * vw, p.y * vh, 5, 0, 7); ctx.fill(); }
+}
+
+/* ---------- MediaPipe pipeline:
+   capture -> (resize/colour handled by the browser + MediaPipe) -> BlazePalm detect
+   -> 21 landmarks -> Euclidean/EMA -> ATM state machine ---------- */
+const video = $("video");
+let hands;
+
+function onResults(res) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!res.multiHandLandmarks || !res.multiHandLandmarks.length) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height); noHand(); return;
+  }
+  const lm = ema(res.multiHandLandmarks[0]);
+  draw(lm, vw, vh);
+  const n = countFingers(lm);
+  $("big").textContent = n;
+  updateStability(n);
+}
+
+async function loop() {
+  if (video.readyState >= 2) await hands.send({image: video});
+  requestAnimationFrame(loop);
+}
+
+async function start() {
+  $("err").textContent = "";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {facingMode: "user", width: {ideal: 640}, height: {ideal: 480}}, audio: false});
+    video.srcObject = stream;
+    await video.play();
+    hands = new Hands({locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`});
+    hands.setOptions({maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.7, minTrackingConfidence: 0.6});
+    hands.onResults(onResults);
+    $("start").style.display = "none";
+    if ("speechSynthesis" in window) speechSynthesis.getVoices();   // warm up voices
+    enter("LANG");
+    loop();
+  } catch (e) {
+    $("err").textContent = "Camera could not start. Allow camera access and open this page over https.";
+    console.error(e);
+  }
+}
+$("startBtn").addEventListener("click", start);
+</script>
+</body>
+</html>
